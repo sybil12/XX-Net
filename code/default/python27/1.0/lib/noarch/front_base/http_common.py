@@ -42,19 +42,22 @@ class Task(object):
         return out_str
 
     def put_data(self, data):
+        # hyper H2
+        if isinstance(data, memoryview):
+            data = data.tobytes()
         self.body_queue.put(data)
         self.body_len += len(data)
 
     def read(self, size=None):
         # fail or cloe if return ""
         if self.body_readed == self.content_length:
-            return memoryview(b'')
+            return b''
 
         if size:
             while self.read_buffer_len < size:
                 data = self.body_queue.get(self.timeout)
                 if not data:
-                    return memoryview(b'')
+                    return b''
 
                 self.read_buffers.append(data)
                 self.read_buffer_len += len(data)
@@ -78,11 +81,11 @@ class Task(object):
                 if self.read_buffer_len == size:
                     self.read_buffers = []
                     self.read_buffer_len = 0
-                    data = buff_view
+                    data = buff_view.tobytes()
                 else:
-                    data = buff_view[:size]
+                    data = buff_view[:size].tobytes()
 
-                    self.read_buffers = [buff_view[size:]]
+                    self.read_buffers = [buff_view[size:].tobytes()]
                     self.read_buffer_len -= size
 
         else:
@@ -92,14 +95,16 @@ class Task(object):
             else:
                 data = self.body_queue.get(self.timeout)
                 if not data:
-                    return memoryview(b'')
+                    return b''
 
         self.body_readed += len(data)
         return data
 
     def read_all(self):
         if self.content_length:
-            buff = bytearray(int(self.content_length))
+            left_body = int(self.content_length) - self.body_readed
+
+            buff = bytearray(left_body)
             buff_view = memoryview(buff)
             p = 0
             for data in self.read_buffers:
@@ -109,7 +114,7 @@ class Task(object):
             self.read_buffers = []
             self.read_buffer_len = 0
 
-            while p < self.content_length:
+            while p < left_body:
                 data = self.read()
                 if not data:
                     break
@@ -117,18 +122,16 @@ class Task(object):
                 buff_view[p:p + len(data)] = data[0:len(data)]
                 p += len(data)
 
-            return buff_view[:p]
+            self.body_readed += p
+            return buff_view[:p].tobytes()
         else:
             out = list()
             while True:
                 data = self.read()
                 if not data:
                     break
-                if isinstance(data, memoryview):
-                    data = data.tobytes()
                 out.append(data)
-            out_buf = "".join(out)
-            return memoryview(out_buf)
+            return "".join(out)
 
     def set_state(self, stat):
         # for debug trace
@@ -156,7 +159,7 @@ class Task(object):
 
         self.responsed = True
         err_text = "response_fail:%s" % reason
-        self.logger.debug("%s %s", self.url, err_text)
+        self.logger.warn("%s %s", self.url, err_text)
         res = simple_http_client.BaseResponse(body=err_text)
         res.task = self
         res.worker = self.worker

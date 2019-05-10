@@ -64,15 +64,15 @@ import urlparse
 import threading
 import zlib
 import traceback
+from mimetypes import guess_type
 
+import check_local_network
 from front import front
 from xlog import getLogger
 xlog = getLogger("gae_proxy")
 
 
 def inflate(data):
-    if isinstance(data, memoryview):
-        data = data.tobytes()
     return zlib.decompress(data, -zlib.MAX_WBITS)
 
 
@@ -138,16 +138,25 @@ def spawn_later(seconds, target, *args, **kwargs):
     return __import__('thread').start_new_thread(wrap, args, kwargs)
 
 
-skip_headers = frozenset(['Vary',
+skip_request_headers = frozenset([
+                          'Vary',
                           'Via',
-                          'X-Google-Cache-Control',
-                          'X-Forwarded-For',
                           'Proxy-Authorization',
                           'Proxy-Connection',
                           'Upgrade',
+                          'X-Google-Cache-Control',
+                          'X-Forwarded-For',
                           'X-Chrome-Variations',
-                          #'Connection',
-                          #'Cache-Control'
+                          ])
+skip_response_headers = frozenset([
+                          # http://en.wikipedia.org/wiki/Chunked_transfer_encoding
+                          'Connection',
+                          'Upgrade',
+                          'Alt-Svc',
+                          'Alternate-Protocol',
+                          'X-Head-Content-Length',
+                          'X-Google-Cache-Control',
+                          'X-Chrome-Variations',
                           ])
 
 
@@ -162,6 +171,8 @@ def send_header(wfile, keyword, value):
         value = re.sub(r'filename=([^"\']+)', 'filename="\\1"', value)
         wfile.write("%s: %s\r\n" % (keyword, value))
         #xlog.debug("Head1 %s: %s", keyword, value)
+    elif keyword in skip_response_headers:
+        return
     else:
         wfile.write("%s: %s\r\n" % (keyword, value))
         #xlog.debug("Head1 %s: %s", keyword, value)
@@ -227,7 +238,7 @@ def pack_request(method, url, headers, body, timeout):
 
     payload = '%s %s HTTP/1.1\r\n' % (method, url)
     payload += ''.join('%s: %s\r\n' % (k, v)
-                       for k, v in headers.items() if k not in skip_headers)
+                       for k, v in headers.items() if k not in skip_request_headers)
     # for k, v in headers.items():
     #    xlog.debug("Send %s: %s", k, v)
     payload += ''.join('X-URLFETCH-%s: %s\r\n' % (k, v)
@@ -277,7 +288,6 @@ def unpack_response(response):
         return response
     except Exception as e:
         response.worker.close("unpack protocol error")
-        front.ip_manager.recheck_ip(response.ssl_sock.ip)
         raise GAE_Exception(600, "unpack protocol:%r at:%s" % (e, traceback.format_exc()))
 
 
@@ -286,55 +296,60 @@ def request_gae_server(headers, body, url, timeout):
     # process status code return by http server
     # raise error, let up layer retry.
 
-    response = front.request("POST", None, "/_gh/", headers, body, timeout)
-    if not response:
-        raise GAE_Exception(600, "fetch gae fail")
+    try:
+        response = front.request("POST", None, "/_gh/", headers, body, timeout)
+        if not response:
+            raise GAE_Exception(600, "fetch gae fail")
 
-    if response.status >= 600:
-        raise GAE_Exception(
-            response.status, "fetch gae fail:%d" % response.status)
+        if response.status >= 600:
+            raise GAE_Exception(
+                response.status, "fetch gae fail:%d" % response.status)
 
-    server_type = response.getheader("server", "")
-    # content_type = response.getheaders("content-type", "")
-    if ("gws" not in server_type and "Google Frontend" not in server_type and "GFE" not in server_type) or \
-            response.status == 403 or response.status == 405:
+        appid = response.ssl_sock.host.split(".")[0]
+        if response.status == 404:
+            # xlog.warning('APPID %r not exists, remove it.', response.ssl_sock.appid)
+            front.appid_manager.report_not_exist(
+                appid, response.ssl_sock.ip)
+            # google_ip.report_connect_closed(response.ssl_sock.ip, "appid not exist")
+            response.worker.close("appid not exist:%s" % appid)
+            raise GAE_Exception(603, "appid not exist %s" % appid)
 
-        # some ip can connect, and server type can be gws
-        # but can't use as GAE server
-        # so we need remove it immediately
+        if response.status == 503:
+            xlog.warning('APPID %r out of Quota, remove it. %s',
+                         appid, response.ssl_sock.ip)
+            front.appid_manager.report_out_of_quota(appid)
+            # google_ip.report_connect_closed(response.ssl_sock.ip, "out of quota")
+            response.worker.close("appid out of quota:%s" % appid)
+            raise GAE_Exception(604, "appid out of quota:%s" % appid)
 
-        xlog.warn("IP:%s not support GAE, headers:%s status:%d", response.ssl_sock.ip, response.headers,
-                  response.status)
-        front.ip_manager.recheck_ip(response.ssl_sock.ip)
-        response.worker.close("ip not support GAE")
-        raise GAE_Exception(602, "ip not support GAE")
+        server_type = response.getheader("server", "")
+        # content_type = response.getheaders("content-type", "")
+        if ("gws" not in server_type and "Google Frontend" not in server_type and "GFE" not in server_type) or \
+                response.status == 403 or response.status == 405:
 
-    appid = response.ssl_sock.host.split(".")[0]
+            # some ip can connect, and server type can be gws
+            # but can't use as GAE server
+            # so we need remove it immediately
 
-    if response.status == 404:
-        # xlog.warning('APPID %r not exists, remove it.', response.ssl_sock.appid)
-        front.appid_manager.report_not_exist(
-            appid, response.ssl_sock.ip)
-        # google_ip.report_connect_closed(response.ssl_sock.ip, "appid not exist")
-        response.worker.close("appid not exist:%s" % appid)
-        raise GAE_Exception(603, "appid not support GAE")
+            xlog.warn("IP:%s not support GAE, headers:%s status:%d", response.ssl_sock.ip, response.headers,
+                      response.status)
+            response.worker.close("ip not support GAE")
+            raise GAE_Exception(602, "ip not support GAE")
 
-    if response.status == 503:
-        xlog.warning('APPID %r out of Quota, remove it. %s',
-                     appid, response.ssl_sock.ip)
-        front.appid_manager.report_out_of_quota(appid)
-        # google_ip.report_connect_closed(response.ssl_sock.ip, "out of quota")
-        response.worker.close("appid out of quota:%s" % appid)
-        raise GAE_Exception(604, "appid out of quota:%s" % appid)
+        response.gps = response.getheader("x-server", "")
 
-    if response.status > 300:
-        raise GAE_Exception(605, "status:%d" % response.status)
+        if response.status > 300:
+            raise GAE_Exception(605, "status:%d" % response.status)
 
-    if response.status != 200:
-        xlog.warn("GAE %s appid:%s status:%d", response.ssl_sock.ip,
-                  appid, response.status)
+        if response.status != 200:
+            xlog.warn("GAE %s appid:%s status:%d", response.ssl_sock.ip,
+                      appid, response.status)
 
-    return response
+        return response
+    except GAE_Exception as e:
+        if e.error_code not in (600, 603, 604):
+            front.ip_manager.recheck_ip(response.ssl_sock.ip, first_report=False)
+        raise e
 
 
 def request_gae_proxy(method, url, headers, body, timeout=None):
@@ -378,9 +393,12 @@ def request_gae_proxy(method, url, headers, body, timeout=None):
     error_msg = []
 
     if not timeout:
-        timeouts = [5, 20, 30]
+        timeouts = [15, 20, 30]
     else:
         timeouts = [timeout]
+
+    if body:
+        timeouts = [timeout + 10 for timeout in timeouts]
 
     for timeout in timeouts:
         request_headers, request_body = pack_request(method, url, headers, body, timeout)
@@ -434,7 +452,7 @@ def request_gae_proxy(method, url, headers, body, timeout=None):
     raise GAE_Exception(600, b"".join(error_msg))
 
 
-def handler(method, url, headers, body, wfile):
+def handler(method, host, url, headers, body, wfile, fallback=None):
     if not url.startswith("http") and not url.startswith("HTTP"):
         xlog.error("gae:%s", url)
         return
@@ -491,15 +509,23 @@ def handler(method, url, headers, body, wfile):
 
     try:
         response = request_gae_proxy(method, url, headers, body)
+        # http://en.wikipedia.org/wiki/Chunked_transfer_encoding
+        response.headers.pop("Transfer-Encoding", None)
         # gae代理请求
     except GAE_Exception as e:
         xlog.warn("GAE %s %s request fail:%r", method, url, e)
+
+        if fallback and host.endswith(front.config.GOOGLE_ENDSWITH):
+            return fallback()
+
         send_response(wfile, e.error_code, body=e.message)
-        return return_fail_message(wfile)
+        return_fail_message(wfile)
+        return "ok"
 
     if response.app_msg:
         # XX-net 自己数据包
-        return send_response(wfile, response.app_status, body=response.app_msg)
+        send_response(wfile, response.app_status, body=response.app_msg)
+        return "ok"
     else:
         response.status = response.app_status
 
@@ -514,10 +540,7 @@ def handler(method, url, headers, body, wfile):
     #　初始化给客户端的headers
     for key, value in response.headers.items():
         key = key.title()
-        if key == 'Transfer-Encoding':
-            # http://en.wikipedia.org/wiki/Chunked_transfer_encoding
-            continue
-        if key in skip_headers:
+        if key in skip_response_headers:
             continue
         response_headers[key] = value
 
@@ -529,19 +552,6 @@ def handler(method, url, headers, body, wfile):
             response_headers['Content-Length'] = response_headers['X-Head-Content-Length']
         del response_headers['X-Head-Content-Length']
         # 只是获取头
-
-    try:
-        wfile.write("HTTP/1.1 %d %s\r\n" % (response.status, response.reason))
-        for key in response_headers:
-            value = response_headers[key]
-            send_header(wfile, key, value)
-            #xlog.debug("Head- %s: %s", key, value)
-        wfile.write("\r\n")
-        wfile.flush()
-        # 写入除body外内容
-    except Exception as e:
-        xlog.info("gae_handler.handler send response fail. e:%r %s", e, url)
-        return
 
     content_length = int(response.headers.get('Content-Length', 0))
     content_range = response.headers.get('Content-Range', '')
@@ -558,7 +568,112 @@ def handler(method, url, headers, body, wfile):
     else:
         body_length = end - start + 1
 
-    body_sended = 0
+    def send_response_headers():
+        wfile.write("HTTP/1.1 %d %s\r\n" % (response.status, response.reason))
+        for key, value in response_headers.items():
+            send_header(wfile, key, value)
+            # xlog.debug("Head- %s: %s", key, value)
+        wfile.write("\r\n")
+        # 写入除body外内容
+
+    def is_text_content_type(content_type):
+        mct, _, sct = content_type.partition('/')
+        if mct == 'text':
+            return True
+        if mct == 'application':
+            sct = sct.split(';', 1)[0]
+            if (sct in ('json', 'javascript', 'x-www-form-urlencoded') or
+                    sct.endswith(('xml', 'script')) or
+                    sct.startswith(('xml', 'rss', 'atom'))):
+                return True
+        return False
+
+    data0 = ""
+    content_type = response_headers.get("Content-Type", "")
+    content_encoding = response_headers.get("Content-Encoding", "")
+    if body_length and \
+            content_encoding == "gzip" and \
+            response.gps < "GPS 3.3.2" and \
+            is_text_content_type(content_type):
+        url_guess_type = guess_type(url)[0]
+        if url_guess_type is None or is_text_content_type(url_guess_type):
+            # try decode and detect type
+
+            min_block = min(1024, body_length)
+            data0 = response.task.read(min_block)
+            if not data0 or len(data0) == 0:
+                xlog.warn("recv body fail:%s", url)
+                return
+
+            gzip_decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            decoded_data0 = gzip_decompressor.decompress(data0)
+
+            deflate_decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+            decoded_data1 = None
+
+            if len(decoded_data0) > 1:
+                CMF, FLG = bytearray(decoded_data0[:2])
+                if CMF & 0x0F == 8 and CMF & 0x80 == 0 and ((CMF << 8) + FLG) % 31 == 0:
+                    decoded_data1 = deflate_decompressor.decompress(decoded_data0[2:])
+
+            if decoded_data1 is None and len(decoded_data0) > 0:
+                try:
+                    decoded_data1 = deflate_decompressor.decompress(decoded_data0)
+                    if deflate_decompressor.unused_data != '':
+                        decoded_data1 = None
+                except:
+                    pass
+
+            if decoded_data1:
+                try:
+                    response_headers.pop("Content-Length", None)
+
+                    if "deflate" in headers.get("Accept-Encoding", ""):
+                        # return deflate data if accept deflate
+                        response_headers["Content-Encoding"] = "deflate"
+
+                        send_response_headers()
+                        while True:
+                            wfile.write(decoded_data0)
+                            if response.task.body_readed >= body_length:
+                                break
+                            data = response.task.read()
+                            decoded_data0 = gzip_decompressor.decompress(data)
+                        xlog.info("GAE send ungziped deflate data to browser t:%d s:%d %s %s %s", (time.time() - request_time) * 1000, content_length, method,
+                                  url, response.task.get_trace())
+
+                    else:
+                        # inflate data and send
+                        del response_headers["Content-Encoding"]
+
+                        send_response_headers()
+                        while True:
+                            wfile.write(decoded_data1)
+                            if response.task.body_readed >= body_length:
+                                break
+                            data = response.task.read()
+                            decoded_data0 = gzip_decompressor.decompress(data)
+                            decoded_data1 = deflate_decompressor.decompress(decoded_data0)
+                        xlog.info("GAE send ungziped data to browser t:%d s:%d %s %s %s", (time.time() - request_time) * 1000, content_length, method,
+                                  url, response.task.get_trace())
+
+                    return
+                except Exception as e:
+                    xlog.info("gae_handler.handler try decode and send response fail. e:%r %s", e, url)
+                    return
+
+    try:
+        send_response_headers()
+
+        if data0:
+            wfile.write(data0)
+            body_sended = len(data0)
+        else:
+            body_sended = 0
+    except Exception as e:
+        xlog.info("gae_handler.handler send response fail. e:%r %s", e, url)
+        return
+
     while True:
         # 可能分片发给客户端
         if body_sended >= body_length:
@@ -573,11 +688,11 @@ def handler(method, url, headers, body, wfile):
         body_sended += len(data)
         try:
             # https 包装
-            ret = wfile._sock.sendall(data)
+            ret = wfile.write(data)
             if ret == ssl.SSL_ERROR_WANT_WRITE or ret == ssl.SSL_ERROR_WANT_READ:
                 #xlog.debug("send to browser wfile.write ret:%d", ret)
                 #ret = wfile.write(data)
-                wfile._sock.sendall(data)
+                wfile.write(data)
         except Exception as e_b:
             if e_b[0] in (errno.ECONNABORTED, errno.EPIPE,
                           errno.ECONNRESET) or 'bad write retry' in repr(e_b):
@@ -589,12 +704,12 @@ def handler(method, url, headers, body, wfile):
     # 完整一次https请求
     xlog.info("GAE t:%d s:%d %s %s %s", (time.time() - request_time) * 1000, content_length, method, url,
               response.task.get_trace())
+    return "ok"
 
 
 class RangeFetch2(object):
-    max_buffer_size = int(front.config.AUTORANGE_MAXSIZE *
-                          front.config.AUTORANGE_THREADS * 1.3)
-    # max buffer size before browser receive: 20M
+
+    all_data_size = {}
 
     def __init__(self, method, url, headers, body, response, wfile):
         self.method = method
@@ -618,6 +733,9 @@ class RangeFetch2(object):
         self.req_end = 0
         self.wait_begin = 0
 
+    def get_all_buffer_size(self):
+        return sum(v for k, v in self.all_data_size.items())
+
     def put_data(self, range_begin, payload):
         with self.lock:
             if range_begin < self.wait_begin:
@@ -626,6 +744,7 @@ class RangeFetch2(object):
 
             self.data_list[range_begin] = payload
             self.data_size += len(payload)
+            self.all_data_size[self] = self.data_size
 
             if self.wait_begin in self.data_list:
                 self.waiter.notify()
@@ -673,17 +792,12 @@ class RangeFetch2(object):
         try:
             self.wfile.write("HTTP/1.1 %d OK\r\n" % state_code)
             for key in response_headers:
-                if key == 'Transfer-Encoding':
-                    continue
-                if key == 'X-Head-Content-Length':
-                    continue
-                if key in skip_headers:
+                if key in skip_response_headers:
                     continue
                 value = response_headers[key]
                 #xlog.debug("Head %s: %s", key.title(), value)
                 send_header(self.wfile, key, value)
             self.wfile.write("\r\n")
-            self.wfile.flush()
         except Exception as e:
             self.keep_running = False
             xlog.info("RangeFetch send response fail:%r %s", e, self.url)
@@ -699,7 +813,13 @@ class RangeFetch2(object):
         threading.Thread(target=self.fetch, args=(
             res_begin, res_end, self.response)).start()
 
-        while self.keep_running and self.wait_begin < self.req_end + 1:
+        ok = "ok"
+        while self.keep_running and \
+                (front.config.use_ipv6 == "force_ipv6" and \
+                check_local_network.IPv6.is_ok() or \
+                front.config.use_ipv6 != "force_ipv6" and \
+                check_local_network.is_ok()) and \
+                self.wait_begin < self.req_end + 1:
             with self.lock:
                 if self.wait_begin not in self.data_list:
                     self.waiter.wait()
@@ -712,34 +832,41 @@ class RangeFetch2(object):
                     del self.data_list[self.wait_begin]
                     self.wait_begin += len(data)
                     self.data_size -= len(data)
+                    self.all_data_size[self] = self.data_size
 
             try:
-                ret = self.wfile._sock.sendall(data)
+                ret = self.wfile.write(data)
                 if ret == ssl.SSL_ERROR_WANT_WRITE or ret == ssl.SSL_ERROR_WANT_READ:
                     xlog.debug(
                         "send to browser wfile.write ret:%d, retry", ret)
-                    ret = self.wfile._sock.sendall(data)
+                    ret = self.wfile.write(data)
                     xlog.debug("send to browser wfile.write ret:%d", ret)
                 del data
             except Exception as e:
                 xlog.info('RangeFetch client closed(%s). %s', e, self.url)
+                ok = None
                 break
         self.keep_running = False
+        self.all_data_size.pop(self, None)
+        return ok
 
     def fetch_worker(self):
-        self.blocked = False
+        blocked = False
         while self.keep_running:
-            if self.data_size > self.max_buffer_size:
-                if not self.blocked:
-                    xlog.debug("fetch_worker blocked, buffer:%d %s",
-                               self.data_size, self.url)
-                self.blocked = True
+            if blocked:
                 time.sleep(0.5)
-                continue
-
-            self.blocked = False
 
             with self.lock:
+                # at least 2 wait workers keep running
+                if self.req_begin > self.wait_begin + front.config.AUTORANGE_MAXSIZE:
+                    if self.get_all_buffer_size() > front.config.AUTORANGE_MAXBUFFERSIZE * (0.8 + len(self.all_data_size) * 0.2):
+                        if not self.blocked:
+                            xlog.debug("fetch_worker blocked, buffer:%d %s",
+                                       self.data_size, self.url)
+                        self.blocked = blocked = True
+                        continue
+                    self.blocked = blocked = False
+
                 if self.req_begin >= self.req_end + 1:
                     break
 

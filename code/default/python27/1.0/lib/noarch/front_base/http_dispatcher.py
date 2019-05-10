@@ -33,7 +33,7 @@ from http2_connection import Http2Worker
 
 
 class HttpsDispatcher(object):
-    idle_time = 20 * 60
+    idle_time = 2 * 60
 
     def __init__(self, logger, config, ip_manager, connection_manager,
                  http1worker=Http1Worker,
@@ -242,10 +242,11 @@ class HttpsDispatcher(object):
             self.request_queue.put(task)
 
             response = q.get(timeout=timeout)
-            if response and response.status==200:
+            if response and response.status == 200:
                 self.success_num += 1
                 self.continue_fail_num = 0
             else:
+                self.logger.warn("task %s %s %s timeout", method, host, path)
                 self.fail_num += 1
                 self.continue_fail_num += 1
                 self.last_fail_time = time.time()
@@ -260,6 +261,7 @@ class HttpsDispatcher(object):
         self.fail_num += 1
         self.continue_fail_num += 1
         self.last_fail_time = time.time()
+        self.logger.warn("retry_task_cb: %s", task.url)
 
         if task.responsed:
             self.logger.warn("retry but responsed. %s", task.url)
@@ -355,7 +357,8 @@ class HttpsDispatcher(object):
 
     def close_all_worker(self, reason="close all worker"):
         for w in list(self.workers):
-            w.close(reason)
+            if w.accept_task:
+                w.close(reason)
 
         self.workers = []
         self.h1_num = 0

@@ -311,9 +311,11 @@ class HttpServerHandler():
         self.logger.warn("unhandler cmd:%s from:%s", self.command, self.address_string())
 
     def send_not_found(self):
+        self.close_connection = 1
         self.wfile.write(b'HTTP/1.1 404\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n404 Not Found')
 
     def send_error(self, code, message=None):
+        self.close_connection = 1
         self.wfile.write('HTTP/1.1 %d\r\n' % code)
         self.wfile.write('Connection: close\r\n\r\n')
         if message:
@@ -416,8 +418,16 @@ class HTTPServer():
         self.http_thread.start()
 
     def init_socket(self):
-        for addr in self.server_address:
-            self.add_listen(addr)
+        server_address = set(self.server_address)
+        ips = [ip for ip, _ in server_address]
+        listen_all_v4 = "0.0.0.0" in ips
+        listen_all_v6 = "::" in ips
+        for ip, port in server_address:
+            if ip not in ("0.0.0.0", "::") and (
+                    listen_all_v4 and '.' in ip or
+                    listen_all_v6 and ':' in ip):
+                continue
+            self.add_listen((ip, port))
 
     def add_listen(self, addr):
         if ":" in addr[0]:

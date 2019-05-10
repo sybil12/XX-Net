@@ -27,5 +27,6 @@ class HostManager(HostManagerBase):
     def get_sni_host(self, ip):
         sni = self.sni_manager.get()
         host = self.get_host()
+
         return sni, host
 

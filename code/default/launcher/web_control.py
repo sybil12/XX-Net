@@ -257,6 +257,7 @@ class Http_Handler(simple_http_server.HttpServerHandler):
                 "x_tunnel_enable": config.get(["modules", "x_tunnel", "auto_start"], 0),
                 "smart_router_enable": config.get(["modules", "smart_router", "auto_start"], 0),
                 "system-proxy": config.get(["modules", "launcher", "proxy"], "smart_router"),
+                "show-compat-suggest": config.get(["show_compat_suggest"], 1),
                 "no_mess_system": config.get(["no_mess_system"], 0),
                 "keep_old_ver_num": config.get(["modules", "launcher", "keep_old_ver_num"], -1),  # -1 means not set yet
                 "postUpdateStat": config.get(["update", "postUpdateStat"], "noChange"),
@@ -347,10 +348,19 @@ class Http_Handler(simple_http_server.HttpServerHandler):
                     config.save()
 
                     data = '{"res":"success"}'
+            elif 'show_compat_suggest' in reqs:
+                show_compat_suggest = int(reqs['show_compat_suggest'][0])
+                if show_compat_suggest != 0 and show_compat_suggest != 1:
+                    data = '{"res":"fail, show_compat_suggest:%s"}' % show_compat_suggest
+                else:
+                    config.set(["show_compat_suggest"], show_compat_suggest)
+                    config.save()
+
+                    data = '{"res":"success"}'
             elif 'no_mess_system' in reqs:
                 no_mess_system = int(reqs['no_mess_system'][0])
                 if no_mess_system != 0 and no_mess_system != 1:
-                    data = '{"res":"fail, show_systray:%s"}' % no_mess_system
+                    data = '{"res":"fail, no_mess_system:%s"}' % no_mess_system
                 else:
                     config.set(["no_mess_system"], no_mess_system)
                     config.save()
@@ -680,17 +690,23 @@ def start(allow_remote=0):
     # should use config.yaml to bind ip
     if not allow_remote:
         allow_remote = config.get(["modules", "launcher", "allow_remote_connect"], 0)
+    host_ip = config.get(["modules", "launcher", "control_ip"], "127.0.0.1")
     host_port = config.get(["modules", "launcher", "control_port"], 8085)
 
     if allow_remote:
-        host_addr = "0.0.0.0"
         xlog.info("allow remote access WebUI")
+
+    if isinstance(host_ip, basestring):
+        listen_ips = [host_ip]
     else:
-        host_addr = "127.0.0.1"
+        listen_ips = list(host_ip)
+    if allow_remote and ("0.0.0.0" not in listen_ips or "::" not in listen_ips):
+        listen_ips.append("0.0.0.0")
+    addresses = [(listen_ip, host_port) for listen_ip in listen_ips]
 
     xlog.info("begin to start web control")
 
-    server = simple_http_server.HTTPServer((host_addr, host_port), Http_Handler, logger=xlog)
+    server = simple_http_server.HTTPServer(addresses, Http_Handler, logger=xlog)
     server.start()
 
     xlog.info("launcher web control started.")

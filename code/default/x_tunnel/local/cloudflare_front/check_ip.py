@@ -15,14 +15,14 @@ python_path = os.path.abspath( os.path.join(root_path, 'python27', '1.0'))
 sys.path.append(root_path)
 
 noarch_lib = os.path.abspath( os.path.join(python_path, 'lib', 'noarch'))
-sys.path.append(noarch_lib)
+sys.path.insert(0, noarch_lib)
 
 if sys.platform == "win32":
     win32_lib = os.path.abspath( os.path.join(python_path, 'lib', 'win32'))
     sys.path.append(win32_lib)
 elif sys.platform.startswith("linux"):
     linux_lib = os.path.abspath( os.path.join(python_path, 'lib', 'linux'))
-    sys.path.append(linux_lib)
+    sys.path.insert(1, linux_lib)
 elif sys.platform == "darwin":
     darwin_lib = os.path.abspath( os.path.join(python_path, 'lib', 'darwin'))
     sys.path.append(darwin_lib)
@@ -122,27 +122,29 @@ if __name__ == "__main__":
     # case 2: ip + domain
     #    connect use domain
 
-    default_ip = "141.101.120.131"
-
+    ip = "141.101.120.131"
     host = "xx-net.net"
-    if len(sys.argv) > 1:
-        ip = sys.argv[1]
-        if not utils.check_ip_valid(ip):
-            ip = default_ip
-            host = sys.argv[1]
-    else:
-        ip = default_ip
-        print("Usage: check_ip.py [ip] [top_domain] [wait_time=0]")
+    sni = host
+
+    args = list(sys.argv[1:])
+
+    if len(args):
+        if utils.check_ip_valid(args[0]):
+            ip = args.pop(0)
+
+    if len(args):
+        host = args.pop(0)
+        sni = host
+
+    if len(args):
+        sni = args.pop(0)
+
+    # print("Usage: check_ip.py [ip] [top_domain] [wait_time=0]")
     xlog.info("test ip:%s", ip)
-
-    if len(sys.argv) > 2:
-        host = sys.argv[2]
     xlog.info("host:%s", host)
+    xlog.info("sni:%s", sni)
 
-    if len(sys.argv) > 3:
-        wait_time = int(sys.argv[3])
-    else:
-        wait_time = 0
+    wait_time = 0
 
     config_path = os.path.join(module_data_path, "cloudflare_front.json")
     config = Config(config_path)
@@ -156,7 +158,7 @@ if __name__ == "__main__":
     #check_all_ip(check_ip)
     #exit(0)
 
-    res = check_ip.check_ip(ip, sni=host, host=host, wait_time=wait_time)
+    res = check_ip.check_ip(ip, sni=sni, host=host, wait_time=wait_time)
     if not res:
         xlog.warn("connect fail")
     elif res.ok:

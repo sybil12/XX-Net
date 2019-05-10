@@ -36,6 +36,7 @@ class ConfigBase(xconfig.Config):
         self.set_var("http2_timeout_active", 15)
         self.set_var("http2_status_to_close", [])
         self.set_var("http2_show_debug", 0)
+        self.set_var("http2_ping_min_interval", 5)
 
         # worker_base
         self.set_var("show_state_debug", 0)
@@ -58,6 +59,7 @@ class ConfigBase(xconfig.Config):
         self.set_var("check_ip_content", "OK")
 
         # connect_creator
+        self.set_var("connect_receive_buffer", 1024 * 128)
         self.set_var("connect_force_http1", 0)
         self.set_var("connect_force_http2", 0)
         self.set_var("check_pkp", [])
